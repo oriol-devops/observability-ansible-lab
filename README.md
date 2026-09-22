@@ -30,8 +30,8 @@ This project demonstrates how to bypass OS package manager limitations (which of
    
 2. **Run the Ansible Playbook:**
    ```bash
-    ansible-playbook observability_install.yml
+    ansible-playbook -i inventory.ini observability_install.yml
 
 3. **Access the Web Interfaces:**
-* Grafana: http://<VAGRANT_NODE_IP>:3000 (Default login: admin/admin)
-* Prometheus: http://<VAGRANT_NODE_IP>:9090
+* Grafana: `http://<VAGRANT_NODE_IP>:3000 (Default login: admin/admin)`
+* Prometheus: `http://<VAGRANT_NODE_IP>:9090`
