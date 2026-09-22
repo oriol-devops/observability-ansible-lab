@@ -1,0 +1,165 @@
+---
+- name: Manual instalation of Prometheus and Node Exporter
+  hosts: all
+  become: yes
+  vars:
+    prometheus_version: "2.51.0"
+    node_exporter_version: "1.7.0"
+
+  tasks:
+    - name: Creating system groups
+      ansible.builtin.group:
+        name: "{{ item }}"
+        system: yes
+      loop:
+        - prometheus
+        - node_exporter
+
+    - name: Creating system users
+      ansible.builtin.user:
+        name: "{{ item }}"
+        group: "{{ item }}"
+        system: yes
+        create_home: no
+        shell: /bin/false
+      loop:
+        - prometheus
+        - node_exporter
+
+    - name: Creating Prometheus directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+
+    - name: Downloading and unzipping binaries in /tmp
+      ansible.builtin.unarchive:
+        src: "{{ item.url }}"
+        dest: /tmp/
+        remote_src: yes
+      loop:
+        - { url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz" }
+        - { url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz" }
+
+    - name: Installing executables in /usr/local/bin
+      ansible.builtin.copy:
+        src: "/tmp/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: yes
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: '0755'
+      loop:
+        - { src: 'prometheus-{{ prometheus_version }}.linux-amd64/prometheus', dest: '/usr/local/bin/prometheus', owner: 'prometheus' }
+        - { src: 'prometheus-{{ prometheus_version }}.linux-amd64/promtool', dest: '/usr/local/bin/promtool', owner: 'prometheus' }
+        - { src: 'node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter', dest: '/usr/local/bin/node_exporter', owner: 'node_exporter' }
+      notify:
+        - Restore SELinux context
+
+    - name: Copying Prometheus console directories
+      ansible.builtin.copy:
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/etc/prometheus/{{ item }}"
+        remote_src: yes
+        owner: prometheus
+        group: prometheus
+      loop:
+        - consoles
+        - console_libraries
+
+    - name: Generating new prometheus.yml configuration file
+      ansible.builtin.copy:
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+        content: |
+          global:
+            scrape_interval: 15s
+
+          scrape_configs:
+            - job_name: "prometheus"
+              static_configs:
+                - targets: ["localhost:9090"]
+
+            - job_name: "node_exporter"
+              static_configs:
+                - targets: ["localhost:9100"]
+      notify: Restart prometheus
+
+    - name: Creating Prometheus service in Systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prometheus.service
+        content: |
+          [Unit]
+          Description=Prometheus
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=prometheus
+          Group=prometheus
+          Type=simple
+          ExecStart=/usr/local/bin/prometheus \
+              --config.file /etc/prometheus/prometheus.yml \
+              --storage.tsdb.path /var/lib/prometheus/ \
+              --web.console.templates=/etc/prometheus/consoles \
+              --web.console.libraries=/etc/prometheus/console_libraries
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart prometheus
+
+    - name: Creating Node Exporter service in Systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart node_exporter
+
+    - name: Opening Firewalld ports
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - 9090/tcp
+        - 9100/tcp
+
+  handlers:
+    - name: Restore SELinux context
+      ansible.builtin.command: restorecon -Rv /usr/local/bin/prometheus /usr/local/bin/promtool /usr/local/bin/node_exporter
+
+    - name: Restart prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Restart node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
