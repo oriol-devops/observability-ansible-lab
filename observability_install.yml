@@ -1,30 +1,103 @@
 ---
-- name: Manual instalation of Prometheus and Node Exporter
+#############################
+# PLAY 1: Monitoring agents #
+#############################
+- name: Node Exporter Instalation
   hosts: all
   become: yes
   vars:
-    prometheus_version: "2.51.0"
     node_exporter_version: "1.7.0"
 
   tasks:
-    - name: Creating system groups
+    - name: Creating system group
       ansible.builtin.group:
-        name: "{{ item }}"
+        name: node_exporter
         system: yes
-      loop:
-        - prometheus
-        - node_exporter
 
     - name: Creating system users
       ansible.builtin.user:
-        name: "{{ item }}"
-        group: "{{ item }}"
+        name: node_exporter 
+        group: node_exporter
         system: yes
         create_home: no
         shell: /bin/false
-      loop:
-        - prometheus
-        - node_exporter
+
+    - name: Downloading and unzipping binaries in /tmp
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd65.tar.gz" 
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Installing executables in /usr/local/bin
+      ansible.builtin.copy:
+        src: 'node_exporter-{{ node_exporter_version }}.linux-amd65/node_exporter'
+        dest: '/usr/local/bin/node_exporter'
+        remote_src: yes
+        owner: node_exporter
+        group: node_exporter
+        mode: '0755'
+      notify: SELinux context restore for Node Exporter
+
+    - name: Creating Node Exporter service in Systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart node_exporter
+
+    - name: Opening Firewalld ports
+      ansible.posix.firewalld:
+        port: 9100/tcp 
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+  handlers:
+    - name: SELinux context restore for Node Exporter
+      ansible.builtin.command: restorecon -Rv /usr/local/bin/node_exporter
+
+    - name: Restart node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+
+###########################
+# PLAY 2: Metrics backend #
+###########################
+- name: Installing and configuring Prometheus
+  hosts: prometheus
+  become: yes
+  vars:
+    prometheus_version: "2.51.0"
+
+  tasks:
+    - name: Creating prometheus group
+      ansible.builtin.group:
+        name: prometheus
+        system: yes
+
+    - name: Creating prometheus user
+      ansible.builtin.user:
+        name: prometheus
+        group: prometheus
+        system: yes
+        create_home: no
+        shell: /bin/false
 
     - name: Creating Prometheus directories
       ansible.builtin.file:
@@ -37,31 +110,26 @@
         - /etc/prometheus
         - /var/lib/prometheus
 
-    - name: Downloading and unzipping binaries in /tmp
+    - name: Downloading and unzipping Prometheus binary
       ansible.builtin.unarchive:
-        src: "{{ item.url }}"
+        src: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
         dest: /tmp/
         remote_src: yes
-      loop:
-        - { url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz" }
-        - { url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz" }
 
-    - name: Installing executables in /usr/local/bin
+    - name: Installing Prometheus executables in /usr/local/bin
       ansible.builtin.copy:
-        src: "/tmp/{{ item.src }}"
-        dest: "{{ item.dest }}"
+        src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
         remote_src: yes
-        owner: "{{ item.owner }}"
-        group: "{{ item.owner }}"
+        owner: prometheus
+        group: prometheus
         mode: '0755'
       loop:
-        - { src: 'prometheus-{{ prometheus_version }}.linux-amd64/prometheus', dest: '/usr/local/bin/prometheus', owner: 'prometheus' }
-        - { src: 'prometheus-{{ prometheus_version }}.linux-amd64/promtool', dest: '/usr/local/bin/promtool', owner: 'prometheus' }
-        - { src: 'node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter', dest: '/usr/local/bin/node_exporter', owner: 'node_exporter' }
-      notify:
-        - Restore SELinux context
+        - prometheus
+        - promtool
+      notify: SELinux context restore for Prometheus
 
-    - name: Copying Prometheus console directories
+    - name: Copying consoles directories
       ansible.builtin.copy:
         src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
         dest: "/etc/prometheus/{{ item }}"
@@ -89,7 +157,9 @@
 
             - job_name: "node_exporter"
               static_configs:
-                - targets: ["localhost:9100"]
+                - targets: 
+                  - "192.168.75.15:9100"
+                  - "192.168.75.16:9100"
       notify: Restart prometheus
 
     - name: Creating Prometheus service in Systemd
@@ -116,39 +186,17 @@
           WantedBy=multi-user.target
       notify: Restart prometheus
 
-    - name: Creating Node Exporter service in Systemd
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/node_exporter.service
-        content: |
-          [Unit]
-          Description=Node Exporter
-          Wants=network-online.target
-          After=network-online.target
-
-          [Service]
-          User=node_exporter
-          Group=node_exporter
-          Type=simple
-          ExecStart=/usr/local/bin/node_exporter
-
-          [Install]
-          WantedBy=multi-user.target
-      notify: Restart node_exporter
-
-    - name: Opening Firewalld ports
+    - name: Opening Prometheus ports in Firewalld
       ansible.posix.firewalld:
-        port: "{{ item }}"
+        port: 9090/tcp
         permanent: yes
         state: enabled
         immediate: yes
-      loop:
-        - 9090/tcp
-        - 9100/tcp
 
   handlers:
-    - name: Restore SELinux context
-      ansible.builtin.command: restorecon -Rv /usr/local/bin/prometheus /usr/local/bin/promtool /usr/local/bin/node_exporter
-
+    - name: SELinux context restore for Prometheus
+      ansible.builtin.command: restorecon -Rv /usr/local/bin/prometheus /usr/local/bin/promtool
+      
     - name: Restart prometheus
       ansible.builtin.systemd:
         name: prometheus
@@ -156,10 +204,83 @@
         daemon_reload: yes
         enabled: yes
 
-    - name: Restart node_exporter
+
+##################################
+# PLAY 3: Frontend visualization #
+##################################
+- name: Installing and configuring Grafana
+  hosts: grafana
+  become: yes
+  vars:
+    grafana_version: "10.4.0"
+
+  tasks:
+    - name: Crear¡ting grafana system group
+      ansible.builtin.group:
+        name: grafana
+        system: yes
+
+    - name: Creating grafana system user
+      ansible.builtin.user:
+        name: grafana
+        group: grafana
+        system: yes
+        create_home: no
+        shell: /bin/false
+
+    - name: Downloading and unzipping Grafana binary
+      ansible.builtin.unarchive:
+        src: "https://dl.grafana.com/oss/release/grafana-{{ grafana_version }}.linux-amd64.tar.gz"
+        dest: /usr/local/
+        remote_src: yes
+        creates: "/usr/local/grafana-v{{ grafana_version }}"
+
+    - name: Creating symbolic link to Grafana
+      ansible.builtin.file:
+        src: "/usr/local/grafana-v{{ grafana_version }}"
+        dest: /usr/local/grafana
+        state: link
+
+    - name: Fixing Grafana directory permissions
+      ansible.builtin.file:
+        path: /usr/local/grafana-v{{ grafana_version }}
+        state: directory
+        owner: grafana
+        group: grafana
+        recurse: yes
+
+    - name: Creating Grafana service in Systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/grafana.service
+        content: |
+          [Unit]
+          Description=Grafana
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=grafana
+          Group=grafana
+          Type=simple
+          WorkingDirectory=/usr/local/grafana
+          ExecStart=/usr/local/grafana/bin/grafana-server
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart grafana
+
+    - name: Opening Grafana port in Firewalld
+      ansible.posix.firewalld:
+        port: 3000/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+  handlers:
+    - name: Restart grafana
       ansible.builtin.systemd:
-        name: node_exporter
+        name: grafana
         state: restarted
         daemon_reload: yes
         enabled: yes
-
